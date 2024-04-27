@@ -1,0 +1,662 @@
+import numpy as np
+import gym
+from gym import spaces
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import copy
+from collections import deque
+import random
+import json
+from torch.optim import Adam
+import time
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class ReplayBuffer():
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=int(capacity))
+
+    def push(self, state, action, reward, next_state, done):
+        state = np.expand_dims(state, 0)
+        next_state = np.expand_dims(next_state, 0)
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        return np.concatenate(state), np.array(action), np.array(reward), np.concatenate(next_state), np.array(done)
+
+    def __len__(self):
+        return len(self.buffer)
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action):
+        super(Actor, self).__init__()
+        # ... (define your actor network architecture)
+        self.lin1 = nn.Linear(4, 400)
+        self.lin2 = nn.Linear(400, 300)
+        self.lin3 = nn.Linear(300, 1)
+        self.max_action = max_action
+
+    def forward(self, x):
+        x = torch.relu(self.lin1(x))
+        x = torch.relu(self.lin2(x))
+        return  torch.tanh(self.lin3(x))
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
+        # ... (define your critic network architecture)
+        self.lin1 = nn.Linear(5, 400)
+        self.lin2 = nn.Linear(400, 300)
+        self.lin3 = nn.Linear(300, 1)
+
+    def forward(self, state, action):
+        
+        if action.dim() == 1:
+            action = action.unsqueeze(-1) 
+       
+        x = torch.cat([state, action], dim=1)
+    
+        x = torch.relu(self.lin1(x))
+        x = torch.relu(self.lin2(x))
+        return self.lin3(x)
+    
+# class Critic(nn.Module):
+
+#     def __init__(self, state_dim, action_dim):
+#         super(Critic, self).__init__()
+#         n_layer = 30
+#         # layer
+#         self.layer_1 = nn.Linear(state_dim, n_layer)
+#         nn.init.normal_(self.layer_1.weight, 0., 0.1)
+#         nn.init.constant_(self.layer_1.bias, 0.1)
+
+#         self.layer_2 = nn.Linear(action_dim, n_layer)
+#         nn.init.normal_(self.layer_2.weight, 0., 0.1)
+#         nn.init.constant_(self.layer_2.bias, 0.1)
+
+#         self.output = nn.Linear(n_layer, 1)
+
+#     def forward(self, s, a):
+#         s = self.layer_1(s)
+#         a = self.layer_2(a)
+#         q_val = self.output(torch.relu(s + a))# sigmoid(0,1),tanh(-1,1),relu>0
+#         return q_val
+# class Critic(nn.Module):
+#     def __init__(self, state_dim, action_dim):
+#         super(Critic, self).__init__()
+#         n_layer = 30
+        
+#         # Adjust layer initialization to correctly handle state and action dimensions
+#         self.layer_1 = nn.Linear(state_dim, n_layer)
+#         nn.init.normal_(self.layer_1.weight, 0., 0.1)
+#         nn.init.constant_(self.layer_1.bias, 0.1)
+
+#         self.layer_2 = nn.Linear(action_dim, n_layer)
+#         nn.init.normal_(self.layer_2.weight, 0., 0.1)
+#         nn.init.constant_(self.layer_2.bias, 0.1)
+
+#         # Output layer to produce Q-value estimate
+#         self.output = nn.Linear(2 * n_layer, 1)  # Adjusted for concatenated state and action layers
+
+#     def forward(self, s, a):
+#         s = torch.relu(self.layer_1(s))
+#         a = torch.relu(self.layer_2(a))
+        
+#         # Concatenate the activated state and action layers before passing to the output layer
+#         combined = torch.cat([s, a], dim=1)  # Ensure correct concatenation along the feature dimension
+        
+#         q_val = self.output(combined)  # No activation function applied to output layer
+#         return q_val
+
+
+class DDPGAgent():
+    # def __init__(self, state_dim, action_dim, max_action):
+    #     self.action_dim = action_dim
+    #     self.gamma = 0.99
+    #     self.tau = 0.001  # target network update parameter
+    #     self.actor = Actor(state_dim, action_dim, max_action).to(device)
+    #     self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
+    #     self.actor_target.load_state_dict(self.actor.state_dict())
+
+    #     self.critic = Critic(state_dim, action_dim).to(device)
+    #     self.critic_target = Critic(state_dim, action_dim).to(device)
+    #     self.critic_target.load_state_dict(self.critic.state_dict())
+
+    #     self.actor_optimizer = Adam(self.actor.parameters())
+    #     self.critic_optimizer = Adam(self.critic.parameters())
+
+    #     self.replay_buffer = ReplayBuffer(1000)
+    def __init__(self, state_dim, action_dim, max_action, replay_buffer_capacity):
+        self.action_dim = action_dim
+        self.gamma = 0.99
+        self.tau = 0.001  # target network update parameter
+        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor_target = copy.deepcopy(self.actor)
+        
+        self.critic = Critic(state_dim + action_dim, 1).to(device)  # Adjusted critic input dimension
+        self.critic_target = copy.deepcopy(self.critic)
+        self.loss_fn = nn.MSELoss(reduction='mean')
+        self.actor_optimizer = optim.Adam(self.actor.parameters())
+        self.critic_optimizer = optim.Adam(self.critic.parameters())
+        
+        # Initialize ReplayBuffer here
+        self.replay_buffer = ReplayBuffer(replay_buffer_capacity)  # Use passed capacity
+        
+    def select_action(self, state, epsilon=0.5):
+        if random.random() < epsilon:
+            return random.randrange(self.action_dim)
+
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        action = self.actor(state)
+        action = action.detach().cpu().numpy()[0]  # Detach for exploration
+        
+        # Consider using a mapping function here if your environment has a discrete action space
+        # temp=action.tolist()
+        # act=temp.index(max(temp))
+        #print(type(act))
+        #print(action_dim)
+        act=0
+        if action > -1 and action< -0.5:  # up
+            act=0
+        elif action >-0.5 and action<0:  # down
+            act=1
+        elif action >0 and action<0.5:   # left
+            act=2
+        elif action >0.5 and action< 1:  # right
+            act=3
+      
+        return act
+
+    def update(self, batch_size):
+        #print(len(self.replay_buffer))
+        
+        if len(self.replay_buffer) < batch_size:
+            return
+
+        state, action, reward, next_state, done = self.replay_buffer.sample(batch_size)
+
+        state = torch.FloatTensor(state).to(device)
+        next_state = torch.FloatTensor(next_state).to(device)
+        action = torch.FloatTensor(action).to(device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(device)
+        done = torch.FloatTensor(done).unsqueeze(1).to(device)
+
+        # Update critic
+        Q_values = self.critic(state, action)
+        with torch.no_grad():  # Detach gradient for stability
+            next_action = self.actor_target(next_state)
+        next_Q_values = self.critic_target(next_state, next_action.detach())
+        expected_Q_values = reward + (1 - done) * self.gamma * next_Q_values
+        expected_Q_values1 = expected_Q_values-5
+    
+        loss = self.loss_fn(Q_values, expected_Q_values.detach())
+        loss1= self.loss_fn(Q_values, expected_Q_values1.detach())
+     
+       
+    
+
+        file_path = "loss_values.txt"  # Specify the file path
+        with open(file_path, 'a') as file:  # Open the file in append mode ('a')
+            # Write the loss values to the file
+            file.write(f"Loss: {loss.item()}, Loss1: {loss1.item()}\n")
+        critic_loss = nn.MSELoss()(Q_values, expected_Q_values)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Update actor
+        actor_loss = -self.critic(state, self.actor(state)).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step() 
+
+        # Soft update of target networks
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+
+
+
+def shuffle_three_parts(lst,change):
+    indices = [i for i, x in enumerate(lst[2:], start=2) if x >-5]
+
+    chosen_indices = np.random.choice(indices, change, replace=False)
+
+    np.random.shuffle(chosen_indices)
+
+    lst_new = lst.copy()
+    for i, index in enumerate(sorted(chosen_indices)):
+        lst_new[index] = lst[chosen_indices[i]]
+
+    return lst_new    
+
+class Simple2DEnvironment(gym.Env):
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, size=10, n_ob=10):
+        super(Simple2DEnvironment, self).__init__()
+
+        self.size = size
+        self.n_ob = n_ob
+        # Action space definition
+        self.action_space = spaces.Discrete(4)
+        # Observation space definition
+        self.observation_space = spaces.Box(low=0, high=size, shape=(2,), dtype=np.float32)
+        # Initialize state
+        self.state = None
+        # Initialize obstacles and target
+        self.obstacles = []
+        self.target = None
+        # Maps for saving/loading
+        self.maps = []
+        self.reset()
+
+    def save_maps(self, filename):
+        with open(filename, 'w') as f:
+            json.dump(self.maps, f)
+
+    def load_maps(self, filename):
+        with open(filename, 'r') as f:
+            self.maps = json.load(f)
+
+    def get_state_representation(self):
+        # Example: State represented by agent's position and target position
+        if self.state is not None and self.target is not None:
+            state_representation = np.array(list(self.state) + list(self.target), dtype=np.float32)
+            return state_representation
+        else:
+            return np.zeros(self.observation_space.shape)
+
+    def step(self, action):
+        if self.state is None:
+            raise ValueError("State has not been initialized. Call reset().")
+
+        x, y = self.state
+
+        # Movement logic
+        #print(action)
+        if action == 0:  # up
+            y = min(y + 1, self.size - 1)
+        elif action == 1:  # down
+            y = max(y - 1, 0)
+        elif action == 2:  # left
+            x = max(x - 1, 0)
+        elif action == 3:  # right
+            x = min(x + 1, self.size - 1)
+
+        self.state = (x, y)
+
+        # Check conditions
+        done = self.state == self.target
+        reward = 100 if done else -1
+
+        if self.state in self.obstacles:
+            self.state = (int(self.size / 2), self.size - 1)  # Reset to start position on collision
+            reward = -10
+
+        return self.get_state_representation(), reward, done, {}
+
+    def reset(self, map_index=None):
+        # Reset or initialize state, obstacles, and target
+        self.state = (int(self.size / 2), self.size - 1)
+        self.target = (int(self.size / 2), 0)
+        self.obstacles = [(random.randint(0, self.size - 1), random.randint(0, self.size - 1)) for _ in range(self.n_ob)]
+
+        if map_index is not None and map_index < len(self.maps):
+            map_data = self.maps[map_index]
+            self.target = map_data['target']
+            self.obstacles = map_data['obstacles']
+
+        return self.get_state_representation()
+
+    def render(self, mode='human'):
+        grid = np.zeros((self.size, self.size), dtype=str)
+        grid[grid == ''] = ' '
+        grid[self.target] = 'T'
+        for obs in self.obstacles:
+            grid[obs] = '#'
+        grid[self.state] = 'X'
+        print('\n'.join([''.join(row) for row in grid]))
+        print()
+
+def continuous_to_discrete(action, n_actions):
+    # Here, you would implement a method to convert the continuous action from DDPG to a discrete action
+    # For simplicity, this example uses a naive approach
+    return int(action * n_actions) % n_actions
+
+    
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+env = Simple2DEnvironment(10,10)
+state_dim  = env.observation_space.shape[0]
+action_dim = env.action_space.n
+buffer = ReplayBuffer(1000)
+agent =DDPGAgent(state_dim, action_dim, buffer,1000)
+
+episodes = 1000 
+batch_size = 32
+epsilon = 1.0
+rewards = []    
+start_time = time.time()   
+map_id = -1
+all_step = 0
+steps = 0 
+n_episodes = 1000
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        state = env.reset()
+        map_id = map_id + 1
+        #print(all_step/each_map)
+        
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+
+        state = env.reset(map_index=map_id)
+    done = False
+    steps = 0  
+    #print(i_episode)
+    while not done and steps < 200:  
+        #action = agent.get_action(state, epsilon)
+        #print(state)
+        action = agent.select_action(state, epsilon)
+        next_state, reward, done, _ = env.step(action)
+
+        
+        agent.replay_buffer.push(state, action, reward, next_state, done)
+        if map_id != 0:
+            buffer.push(state, action, reward, next_state, done)
+            agent.update(batch_size)
+        total_reward += reward
+        state = next_state
+        steps += 1  
+
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+    rewards.append(total_reward)
+    epsilon *= 0.995
+end_time = time.time() 
+print(f'train time: {end_time-start_time} ')
+
+start_time = time.time()   
+map_id = -1
+all_step = 0
+# test
+steps = 0 
+n_episodes = 1000
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+epsilon = 0
+rewards = []
+print('test')
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        map_id = map_id + 1
+        state = env.reset(map_index=map_id)
+
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+        state = env.reset(map_index=map_id)
+        
+    done = False
+    steps = 0 
+    #print(i_episode)
+    while not done and steps < 100:  
+
+        action = agent.select_action(state, epsilon=0.05) 
+        next_state, reward, done, _ = env.step(action)
+        #next_state, reward, done, _ = env.step(action)
+        agent.replay_buffer.push(state, action, reward, next_state, done)
+        total_reward += reward
+        state = next_state
+        steps += 1
+    rewards.append(total_reward)
+    #print(steps)
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+end_time = time.time() 
+print(f'test time: {end_time-start_time} ')
+
+
+# def shuffle_three_parts(lst,change):
+#     indices = [i for i, x in enumerate(lst[2:], start=2) if x >-5]
+
+#     chosen_indices = np.random.choice(indices, change, replace=False)
+
+#     np.random.shuffle(chosen_indices)
+
+#     lst_new = lst.copy()
+#     for i, index in enumerate(sorted(chosen_indices)):
+#         lst_new[index] = lst[chosen_indices[i]]
+
+#     return lst_new    
+def shuffle_three_parts(lst, change):
+    indices = [i for i, x in enumerate(lst[2:], start=2) if x > -5]
+
+    # Ensure 'change' does not exceed the length of 'indices'
+    actual_change = min(change, len(indices))
+
+    if actual_change == 0:  # Guard against empty 'indices'
+        return lst
+
+    chosen_indices = np.random.choice(indices, actual_change, replace=False)
+    np.random.shuffle(chosen_indices)
+
+    lst_new = lst.copy()
+    for i, index in enumerate(sorted(chosen_indices)):
+        lst_new[index] = lst[chosen_indices[i]]
+
+    return lst_new
+
+
+start_time = time.time()   
+map_id = -1
+all_step = 0
+# unlearning
+steps = 0 
+n_episodes = 200
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+print('unlearning')
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        state = env.reset()
+        map_id = map_id + 1
+        #print(all_step/each_map)
+        
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+
+        state = env.reset(map_index=map_id)
+    done = False
+    steps = 0 
+    while not done and steps < 100: 
+
+        if map_id == 0:
+
+            state = shuffle_three_parts(state,3)
+            action = agent.select_action(state, epsilon)
+            next_state, reward, done, _ = env.step(action)
+          
+            agent.replay_buffer.push(state, action, reward, next_state, done)
+            agent.update(batch_size)
+        else:
+            action = agent.select_action(state, epsilon)
+            next_state, reward, done, _ = env.step(action)
+            buffer.push(state, action, reward, next_state, done)
+
+            agent.update(batch_size)
+        total_reward += reward
+        state = next_state
+        steps += 1  
+
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+    rewards.append(total_reward)
+    epsilon *= 0.995
+end_time = time.time() 
+print(f'unlearning time: {end_time-start_time} ')
+
+start_time = time.time()   
+map_id = -1
+all_step = 0
+
+steps = 0 
+n_episodes = 1000
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+epsilon = 0
+rewards = []
+print('test')
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        map_id = map_id + 1
+        state = env.reset(map_index=map_id)
+        
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+        state = env.reset(map_index=map_id)
+        
+    done = False
+    steps = 0  
+
+    while not done and steps < 100:  
+        action = agent.select_action(state, epsilon=0.05) 
+        next_state, reward, done, _ = env.step(action)
+        #next_state, reward, done, _ = env.step(action)
+        agent.replay_buffer.push(state, action, reward, next_state, done)
+        total_reward += reward
+        state = next_state
+        steps += 1  
+    rewards.append(total_reward)
+
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+end_time = time.time() 
+print(f'test time: {end_time-start_time} ')
+
+
+
+
+start_time = time.time()
+map_id = -1
+all_step = 0
+# LFS
+steps = 0 
+n_episodes = 200
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+print('lfs')
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        state = env.reset()
+        map_id = map_id + 1
+        #print(all_step/each_map)
+        
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+
+        state = env.reset(map_index=map_id)
+    done = False
+    steps = 0 
+    while not done and steps < 100: 
+
+        if map_id != 0:
+
+            action = agent.select_action(state, 1)
+            next_state, reward, done, _ = env.step(action)
+            buffer.push(state, action, reward, next_state, done)
+            agent.update(batch_size)
+            
+           
+        # else:
+        #     action = agent.select_action(state, epsilon)
+        #     next_state, reward, done, _ = env.step(action)
+        #     buffer.push(state, action, reward, next_state, done)
+        #     agent.update(batch_size)
+
+        total_reward += reward
+        state = next_state
+        steps += 1  
+
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+    rewards.append(total_reward)
+    epsilon *= 0.995
+
+end_time = time.time() 
+print(f'lfs time: {end_time-start_time} ')
+map_id = -1
+all_step = 0
+
+
+start_time = time.time()
+map_id = -1
+all_step = 0
+
+steps = 0 
+n_episodes = 1000
+n_maps = 20
+each_map = n_episodes/n_maps
+total_reward = 0
+epsilon = 0
+rewards = []
+print('LFS_test')
+for i_episode in range(n_episodes):
+    all_step = all_step + steps
+    if i_episode%each_map ==0 :
+        map_id = map_id + 1
+        state = env.reset(map_index=map_id)
+        
+        all_step = 0
+        epsilon = 1.0
+        total_reward = 0
+        #env.render()
+    else:
+        state = env.reset(map_index=map_id)
+        
+    done = False
+    steps = 0  
+
+    while not done and steps < 100:  
+        action = agent.select_action(state, epsilon=0.05) 
+        next_state, reward, done, _ = env.step(action)
+        total_reward += reward
+        state = next_state
+        steps += 1  
+    rewards.append(total_reward)
+
+    if (i_episode+1)%each_map ==0 :
+        print(f'Map {map_id} Reward: {total_reward/each_map} steps: {all_step/each_map}')
+end_time = time.time()
+print(f'lfs_test: {end_time-start_time} ')
